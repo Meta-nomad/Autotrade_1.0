@@ -29,7 +29,6 @@ class MexcFeed:
         self.settings = settings
         self._stop = asyncio.Event()
         self._http: httpx.AsyncClient | None = None
-        self._refreshing: set[str] = set()
 
     async def bootstrap(self) -> None:
         self._http = httpx.AsyncClient(timeout=15.0, headers={"Language": "en-US"})
@@ -39,7 +38,6 @@ class MexcFeed:
             async with semaphore:
                 try:
                     await self._load_contract(symbol)
-                    await self._refresh_depth(symbol)
                     await self._load_klines(symbol)
                     await self._load_funding(symbol)
                 except Exception as exc:  # feed retries live even if bootstrap is partial
@@ -67,26 +65,6 @@ class MexcFeed:
         state.contract_size = float(data.get("contractSize") or 1.0)
         state.maintenance_margin_rate = float(data.get("maintenanceMarginRate") or 0.005)
         state.api_allowed = bool(data.get("apiAllowed", True))
-
-    async def _refresh_depth(self, symbol: str) -> None:
-        if symbol in self._refreshing:
-            return
-        self._refreshing.add(symbol)
-        try:
-            data = await self._get(f"/api/v1/contract/depth/{symbol}", {"limit": 200})
-            if not isinstance(data, dict):
-                return
-            state = self.market.symbol(symbol)
-            state.book("mexc").apply_snapshot(
-                data.get("bids", []),
-                data.get("asks", []),
-                version=int(data["version"]) if data.get("version") is not None else None,
-                qty_multiplier=state.contract_size,
-                ts=float(data.get("timestamp", time.time() * 1000)) / 1000.0,
-            )
-            state.record_book_mid("mexc")
-        finally:
-            self._refreshing.discard(symbol)
 
     async def _load_klines(self, symbol: str) -> None:
         now = int(time.time())
@@ -140,6 +118,25 @@ class MexcFeed:
             next_funding_at=next_settle,
         )
 
+    def subscription_messages(self) -> list[dict[str, Any]]:
+        messages: list[dict[str, Any]] = []
+        for symbol in self.settings.symbols:
+            messages.extend(
+                (
+                    {"method": "sub.deal", "param": {"symbol": symbol}},
+                    {
+                        "method": "sub.depth.full",
+                        "param": {"symbol": symbol, "limit": 20},
+                    },
+                    {
+                        "method": "sub.funding.rate",
+                        "param": {"symbol": symbol},
+                        "gzip": False,
+                    },
+                )
+            )
+        return messages
+
     async def run(self) -> None:
         backoff = 1.0
         while not self._stop.is_set():
@@ -152,18 +149,8 @@ class MexcFeed:
                 ) as ws:
                     self.market.feed_connected(self.name)
                     backoff = 1.0
-                    for symbol in self.settings.symbols:
-                        await ws.send(json.dumps({"method": "sub.deal", "param": {"symbol": symbol}}))
-                        await ws.send(json.dumps({"method": "sub.depth", "param": {"symbol": symbol}}))
-                        await ws.send(
-                            json.dumps(
-                                {
-                                    "method": "sub.funding.rate",
-                                    "param": {"symbol": symbol},
-                                    "gzip": False,
-                                }
-                            )
-                        )
+                    for message in self.subscription_messages():
+                        await ws.send(json.dumps(message))
                     heartbeat = asyncio.create_task(self._heartbeat(ws))
                     try:
                         async for raw in ws:
@@ -236,17 +223,14 @@ class MexcFeed:
         elif channel == "push.depth":
             data = payload.get("data") or {}
             version = int(data["version"]) if data.get("version") is not None else None
-            applied = state.book("mexc").apply_delta(
+            state.book("mexc").apply_snapshot(
                 data.get("bids", []),
                 data.get("asks", []),
                 version=version,
                 qty_multiplier=state.contract_size,
                 ts=float(data.get("cts") or ts * 1000) / 1000.0,
             )
-            if applied:
-                state.record_book_mid("mexc", ts)
-            else:
-                asyncio.create_task(self._refresh_depth(symbol))
+            state.record_book_mid("mexc", ts)
         elif channel == "push.funding.rate":
             data = payload.get("data") or {}
             next_settle = float(data.get("nextSettleTime") or 0.0)

@@ -21,6 +21,13 @@ def test_public_feed_message_parsers(tmp_path) -> None:
         )
 
         mexc = MexcFeed(market, settings)
+        subscriptions = mexc.subscription_messages()
+        assert {item["method"] for item in subscriptions} == {
+            "sub.deal",
+            "sub.depth.full",
+            "sub.funding.rate",
+        }
+        assert not any(item["method"] == "sub.depth" for item in subscriptions)
         # MEXC acknowledges subscriptions with a string data payload. This
         # message must be ignored instead of tearing down the websocket.
         await mexc._handle(
@@ -43,7 +50,9 @@ def test_public_feed_message_parsers(tmp_path) -> None:
                     "symbol": "BTC_USDT",
                     "ts": 1_001_000,
                     "data": {
-                        "version": 11,
+                        # Full-depth snapshots do not require a contiguous
+                        # version and replace the previous local book.
+                        "version": 50,
                         "cts": 1_001_000,
                         "bids": [["100", "0"], ["99", "30"]],
                         "asks": [["101", "15"]],
@@ -53,7 +62,8 @@ def test_public_feed_message_parsers(tmp_path) -> None:
         )
         assert state.trades["mexc"][-1].side == Side.LONG
         assert state.trades["mexc"][-1].base_qty == 0.02
-        assert state.book("mexc").version == 11
+        assert state.book("mexc").version == 50
+        assert state.book("mexc").best_bid_ask() == (99.0, 101.0)
 
         bybit = BybitFeed(market, settings)
         await bybit._handle(

@@ -16,6 +16,7 @@ logging.basicConfig(
     level=getattr(logging, settings.log_level, logging.INFO),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
 service = PaperTradingService(settings)
 
 
@@ -30,7 +31,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Order Flow Paper Lab",
-    version="0.1.1",
+    version="0.1.2",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url=None,
