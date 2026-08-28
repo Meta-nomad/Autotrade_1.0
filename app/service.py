@@ -52,6 +52,13 @@ class PaperTradingService:
         else:
             self.tasks.append(asyncio.create_task(self._start_live_feeds(), name="live-feeds-bootstrap"))
         self.tasks.append(asyncio.create_task(self._engine_loop(), name="paper-engine"))
+        self.tasks.append(asyncio.create_task(self._status_log_loop(), name="status-log"))
+        LOGGER.info(
+            "SERVICE READY mode=%s symbols=%d paper_balance=%.2f",
+            self.settings.data_mode,
+            len(self.settings.symbols),
+            self.settings.paper_balance,
+        )
 
     async def _start_live_feeds(self) -> None:
         mexc = MexcFeed(self.market, self.settings)
@@ -60,14 +67,41 @@ class PaperTradingService:
         if self.settings.enable_binance:
             feeds.append(BinanceFeed(self.market, self.settings))
         self.feeds = feeds
+
+        # Start public WebSockets immediately. MEXC REST warm-up is useful for
+        # historical bars and contract metadata, but it must never hold Bybit
+        # and Binance market data hostage when REST is slow or unavailable.
+        runners = [asyncio.create_task(feed.run(), name=f"feed-{feed.name}") for feed in feeds]
+        self.tasks.extend(runners)
+        LOGGER.info("LIVE FEEDS STARTED venues=%s", ",".join(feed.name for feed in feeds))
         try:
             await mexc.bootstrap()
+            LOGGER.info("MEXC BOOTSTRAP COMPLETE symbols=%d", len(self.settings.symbols))
         except Exception as exc:
             LOGGER.exception("MEXC bootstrap failed: %s", exc)
             await self.storage.event(time.time(), "ERROR", "MEXC_BOOTSTRAP", str(exc))
-        runners = [asyncio.create_task(feed.run(), name=f"feed-{feed.name}") for feed in feeds]
-        self.tasks.extend(runners)
         await asyncio.gather(*runners)
+
+    async def _status_log_loop(self) -> None:
+        """Emit a low-volume operational heartbeat for hosting logs."""
+        await asyncio.sleep(10.0)
+        while not self._stopping:
+            now = time.time()
+            lag = now - self.last_engine_tick if self.last_engine_tick else -1.0
+            feed_parts: list[str] = []
+            errors: list[str] = []
+            for name, status in self.market.feeds.items():
+                state = "online" if status.connected else "offline"
+                feed_parts.append(f"{name}:{state}/{status.messages}")
+                if status.last_error:
+                    errors.append(f"{name}={status.last_error[:120]}")
+            LOGGER.info(
+                "PAPER STATUS engine_lag=%.1fs feeds=%s errors=%s",
+                lag,
+                ",".join(feed_parts),
+                " | ".join(errors) if errors else "none",
+            )
+            await asyncio.sleep(60.0)
 
     def _deduplicated(self, signal: Signal, now: float) -> bool:
         key = (signal.strategy, signal.symbol, signal.setup, int(signal.side))
@@ -181,4 +215,3 @@ class PaperTradingService:
         with suppress(Exception):
             await self.storage.event(time.time(), "INFO", "SERVICE_STOP", "")
         await self.storage.close()
-

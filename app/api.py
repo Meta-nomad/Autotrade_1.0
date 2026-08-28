@@ -31,7 +31,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Order Flow Paper Lab",
-    version="0.1.2",
+    version="0.1.3",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url=None,
@@ -102,6 +102,7 @@ table{width:100%;border-collapse:collapse;background:var(--card);border:1px soli
 @media(max-width:900px){.grid{grid-template-columns:1fr}.top{align-items:flex-start;flex-direction:column}main{padding:18px}.tablewrap{overflow:auto}}
 </style></head><body><main>
 <div class="top"><div><h1>Order Flow Paper Lab</h1><div class="muted">Реальные рыночные данные · виртуальные деньги · реальные ордера отключены</div></div><div class="badge">PAPER ONLY</div></div>
+<div id="runtime" class="muted">Подключение к рыночным потокам…</div>
 <div id="accounts" class="grid"></div>
 <section class="section"><h2>Потоки данных</h2><div id="feeds" class="feeds"></div></section>
 <section class="section"><h2>Открытые позиции</h2><div class="tablewrap"><table><thead><tr><th>Счёт</th><th>Пара</th><th>Сторона</th><th>Сетап</th><th>Вход</th><th>Mark</th><th>PnL</th><th>R</th></tr></thead><tbody id="positions"></tbody></table></div></section>
@@ -111,9 +112,10 @@ const token=new URLSearchParams(location.search).get('token')||'';const q=token?
 const n=(v,d=2)=>Number(v||0).toLocaleString('ru-RU',{minimumFractionDigits:d,maximumFractionDigits:d});
 const cls=v=>Number(v)>=0?'positive':'negative';
 async function load(){try{const [s,t]=await Promise.all([fetch('/api/status'+q).then(r=>r.json()),fetch('/api/trades'+q).then(r=>r.json())]);
+document.getElementById('runtime').textContent=`Движок: ${s.last_engine_error?'ошибка: '+s.last_engine_error:'работает'} · задержка ${n(s.engine_lag_seconds,1)} с · uptime ${n(s.uptime_seconds/60,1)} мин`;
 document.getElementById('accounts').innerHTML=Object.values(s.accounts).map(a=>`<div class="card account"><h2>${a.name}</h2><div class="metric"><span class="muted">Equity</span><span class="value">${n(a.equity)} USDT</span></div><div class="metric"><span class="muted">Доходность</span><span class="value ${cls(a.return_pct)}">${n(a.return_pct)}%</span></div><div class="metric"><span class="muted">Просадка</span><span class="value ${cls(a.drawdown_pct)}">${n(a.drawdown_pct)}%</span></div><div class="metric"><span class="muted">W / L</span><span class="value">${a.wins} / ${a.losses}</span></div><div class="metric"><span class="muted">Комиссии</span><span class="value">${n(a.total_fees)} USDT</span></div><div class="metric"><span class="muted">Статус</span><span class="value">${a.halted_reason||'активен'}</span></div></div>`).join('');
 document.getElementById('feeds').innerHTML=Object.values(s.market.feeds).map(f=>`<div class="feed"><span class="dot ${f.connected?'on':''}"></span>${f.name}: ${f.connected?'online':'offline'} · ${f.messages}</div>`).join('');
 const pos=[];Object.values(s.accounts).forEach(a=>a.positions.forEach(p=>pos.push({...p,account:a.name})));document.getElementById('positions').innerHTML=pos.length?pos.map(p=>`<tr><td>${p.account}</td><td>${p.symbol}</td><td>${p.side}</td><td>${p.setup}</td><td>${n(p.entry_price,5)}</td><td>${n(p.mark_price,5)}</td><td class="${cls(p.unrealized_pnl)}">${n(p.unrealized_pnl)}</td><td>${n(p.current_r)}</td></tr>`).join(''):'<tr><td colspan="8" class="muted">Пока нет открытых позиций</td></tr>';
 document.getElementById('trades').innerHTML=t.length?t.slice(0,50).map(x=>`<tr><td>${new Date(x.closed_at*1000).toLocaleString()}</td><td>${x.account}</td><td>${x.symbol}</td><td>${x.side}</td><td>${x.reason}</td><td class="${cls(x.net_pnl)}">${n(x.net_pnl)}</td><td>${n(x.r_multiple)}</td></tr>`).join(''):'<tr><td colspan="7" class="muted">Закрытых сделок пока нет</td></tr>';
-}catch(e){console.error(e)}}load();setInterval(load,10000);
+}catch(e){document.getElementById('runtime').textContent='Dashboard API недоступен: '+e;console.error(e)}}load();setInterval(load,10000);
 </script></body></html>"""
