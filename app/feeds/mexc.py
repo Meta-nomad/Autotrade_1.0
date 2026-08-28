@@ -195,10 +195,16 @@ class MexcFeed:
 
     async def _handle(self, raw: str | bytes) -> None:
         payload = self._decode(raw)
-        channel = payload.get("channel", "")
-        if channel == "pong" or not channel:
+        if not isinstance(payload, dict):
             return
-        symbol = str(payload.get("symbol") or payload.get("data", {}).get("symbol") or "")
+        channel = str(payload.get("channel") or "")
+        # Subscription acknowledgements use data="success" rather than an
+        # object. They are control messages, not market events.
+        if channel == "pong" or not channel or channel.startswith("rs."):
+            return
+        raw_data = payload.get("data")
+        data_symbol = raw_data.get("symbol") if isinstance(raw_data, dict) else ""
+        symbol = str(payload.get("symbol") or data_symbol or "")
         if not symbol:
             return
         symbol = symbol.upper().replace("/", "_")
@@ -256,4 +262,3 @@ class MexcFeed:
         self._stop.set()
         if self._http is not None:
             await self._http.aclose()
-

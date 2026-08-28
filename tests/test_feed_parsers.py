@@ -21,6 +21,11 @@ def test_public_feed_message_parsers(tmp_path) -> None:
         )
 
         mexc = MexcFeed(market, settings)
+        # MEXC acknowledges subscriptions with a string data payload. This
+        # message must be ignored instead of tearing down the websocket.
+        await mexc._handle(
+            json.dumps({"channel": "rs.sub.deal", "data": "success"})
+        )
         await mexc._handle(
             json.dumps(
                 {
@@ -82,4 +87,3 @@ def test_public_feed_message_parsers(tmp_path) -> None:
         assert state.trades["binance"][-1].side == Side.LONG
 
     asyncio.run(scenario())
-
