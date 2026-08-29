@@ -38,6 +38,9 @@ class PaperTradingService:
         self._last_feature_persist = 0.0
         self._last_account_persist = 0.0
         self._last_equity_persist = 0.0
+        self.signal_count = 0
+        self.open_count = 0
+        self.close_count = 0
 
     async def start(self) -> None:
         await self.storage.initialise()
@@ -95,10 +98,49 @@ class PaperTradingService:
                 feed_parts.append(f"{name}:{state}/{status.messages}")
                 if status.last_error:
                     errors.append(f"{name}={status.last_error[:120]}")
+            diagnostics = self.router.diagnostics()
+            state_counts: dict[str, int] = {}
+            for item in diagnostics.values():
+                decision_state = str(item.get("state") or "unknown")
+                state_counts[decision_state] = state_counts.get(decision_state, 0) + 1
+            ready_count = sum(bool(item.get("data_ready")) for item in diagnostics.values())
+            scored = [
+                item for item in diagnostics.values()
+                if isinstance(item.get("best_score"), (int, float))
+            ]
+            best = max(scored, key=lambda item: float(item["best_score"])) if scored else None
+            best_text = (
+                f"{best['symbol']}/{best['best_setup']}:{float(best['best_score']):.1f}"
+                if best
+                else "none"
+            )
+            decision_text = ",".join(
+                f"{name}:{count}" for name, count in sorted(state_counts.items())
+            ) or "none"
+            blocker_counts: dict[str, int] = {}
+            for item in diagnostics.values():
+                for blocker in item.get("blockers", []):
+                    name = str(blocker)
+                    blocker_counts[name] = blocker_counts.get(name, 0) + 1
+            blocker_text = ",".join(
+                f"{name}:{count}" for name, count in sorted(blocker_counts.items())
+            ) or "none"
+            accounts = self.broker.status()
+            position_count = sum(int(item["positions_count"]) for item in accounts.values())
             LOGGER.info(
-                "PAPER STATUS engine_lag=%.1fs feeds=%s errors=%s",
+                "PAPER STATUS engine_lag=%.1fs feeds=%s ready=%d/%d blockers=%s decisions=%s "
+                "best=%s signals=%d opens=%d closes=%d positions=%d errors=%s",
                 lag,
                 ",".join(feed_parts),
+                ready_count,
+                len(self.settings.symbols),
+                blocker_text,
+                decision_text,
+                best_text,
+                self.signal_count,
+                self.open_count,
+                self.close_count,
+                position_count,
                 " | ".join(errors) if errors else "none",
             )
             await asyncio.sleep(60.0)
@@ -121,6 +163,7 @@ class PaperTradingService:
                 }
                 closed = self.broker.evaluate_positions(features, tick_started)
                 for trade in closed:
+                    self.close_count += 1
                     await self.storage.save_trade(trade)
                     LOGGER.info(
                         "PAPER CLOSE account=%s symbol=%s reason=%s pnl=%.2f R=%.2f",
@@ -137,9 +180,11 @@ class PaperTradingService:
                     for signal in (control_signal, orderflow_signal):
                         if signal is None or not self._deduplicated(signal, tick_started):
                             continue
+                        self.signal_count += 1
                         await self.storage.save_signal(signal)
                         opened = self.broker.handle_signal(signal, tick_started)
                         for position in opened:
+                            self.open_count += 1
                             LOGGER.info(
                                 "PAPER OPEN account=%s symbol=%s side=%s setup=%s score=%.1f notional=%.2f",
                                 position.account,
@@ -196,6 +241,15 @@ class PaperTradingService:
             "last_engine_error": self.last_engine_error,
             "accounts": self.broker.status(),
             "market": self.market.status(),
+            "diagnostics": await self.diagnostics(),
+        }
+
+    async def diagnostics(self) -> dict[str, Any]:
+        return {
+            "signal_count_since_start": self.signal_count,
+            "open_count_since_start": self.open_count,
+            "close_count_since_start": self.close_count,
+            "symbols": self.router.diagnostics(),
         }
 
     async def stop(self) -> None:

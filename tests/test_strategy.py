@@ -26,12 +26,38 @@ def test_order_flow_expansion_signal_scores_high(tmp_path) -> None:
         atr_pct=0.006,
     )
 
-    signal = OrderFlowStrategy(settings).evaluate(state, feature, now=1_000)
+    strategy = OrderFlowStrategy(settings)
+    signal = strategy.evaluate(state, feature, now=1_000)
 
     assert signal is not None
     assert signal.setup == "EXPANSION_BREAKOUT"
     assert signal.side == Side.LONG
     assert signal.score >= 90
+    assert strategy.last_diagnostics["BTC_USDT"]["state"] == "signal"
+    assert strategy.last_diagnostics["BTC_USDT"]["best_score"] == signal.score
+
+
+def test_order_flow_diagnostics_explain_not_ready(tmp_path) -> None:
+    settings = make_settings(tmp_path / "not-ready.db")
+    state = SymbolState("BTC_USDT")
+    feature = FeatureSnapshot(
+        symbol="BTC_USDT",
+        ts=1_000,
+        price=100,
+        spread_bps=2,
+        data_ready=False,
+        trade_count_60s=18,
+        stale_venues=("mexc",),
+    )
+    strategy = OrderFlowStrategy(settings)
+
+    assert strategy.evaluate(state, feature, now=1_000) is None
+    diagnostic = strategy.last_diagnostics["BTC_USDT"]
+    assert diagnostic["state"] == "not_ready"
+    assert diagnostic["stale_venues"] == ["mexc"]
+    assert diagnostic["trade_count_60s"] == 18
+    assert "mexc_book_stale" in diagnostic["blockers"]
+    assert "too_few_trades" in diagnostic["blockers"]
 
 
 def test_control_is_exactly_previous_twenty_completed_bars() -> None:
@@ -63,4 +89,3 @@ def test_control_is_exactly_previous_twenty_completed_bars() -> None:
     assert signal is not None
     assert signal.setup == "DONCHIAN_20"
     assert signal.side == Side.LONG
-

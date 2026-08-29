@@ -103,6 +103,7 @@ class ControlStrategy:
 class OrderFlowStrategy:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self.last_diagnostics: dict[str, dict[str, object]] = {}
 
     def evaluate(
         self,
@@ -110,9 +111,47 @@ class OrderFlowStrategy:
         features: FeatureSnapshot,
         now: float | None = None,
     ) -> Signal | None:
+        current_time = now or time.time()
+        mexc_history = state.price_history.get("mexc")
+        history_span = (
+            mexc_history[-1][0] - mexc_history[0][0]
+            if mexc_history and len(mexc_history) > 1
+            else 0.0
+        )
+        blockers: list[str] = []
+        if features.price <= 0:
+            blockers.append("no_price")
+        if "mexc" in features.stale_venues:
+            blockers.append("mexc_book_stale")
+        if "bybit" in features.stale_venues and "binance" in features.stale_venues:
+            blockers.append("secondary_books_stale")
+        if features.spread_bps >= 35.0:
+            blockers.append("spread_too_wide")
+        if features.trade_count_60s < 20:
+            blockers.append("too_few_trades")
+        if history_span < 300.0:
+            blockers.append("short_price_history")
+        if len(state.hour_closes) < 50:
+            blockers.append("short_hour_history")
+        diagnostic: dict[str, object] = {
+            "symbol": state.symbol,
+            "ts": current_time,
+            "data_ready": features.data_ready,
+            "state": "not_ready",
+            "candidate_count": 0,
+            "best_setup": None,
+            "best_score": None,
+            "threshold": self.settings.signal_threshold,
+            "stale_venues": list(features.stale_venues),
+            "spread_bps": features.spread_bps,
+            "trade_count_60s": features.trade_count_60s,
+            "history_span_seconds": history_span,
+            "hour_closes": len(state.hour_closes),
+            "blockers": blockers,
+        }
+        self.last_diagnostics[state.symbol] = diagnostic
         if not features.data_ready:
             return None
-        current_time = now or time.time()
         candidates = [
             candidate
             for candidate in (
@@ -122,11 +161,17 @@ class OrderFlowStrategy:
             )
             if candidate is not None
         ]
+        diagnostic["candidate_count"] = len(candidates)
         if not candidates:
+            diagnostic["state"] = "no_setup"
             return None
         candidate = max(candidates, key=lambda item: item.score)
+        diagnostic["best_setup"] = candidate.setup
+        diagnostic["best_score"] = candidate.score
         if candidate.score < self.settings.signal_threshold:
+            diagnostic["state"] = "below_threshold"
             return None
+        diagnostic["state"] = "signal"
 
         stop_multiplier = {
             "TREND_PULLBACK": 1.9,
@@ -313,3 +358,5 @@ class StrategyRouter:
             self.order_flow.evaluate(state, features, now),
         )
 
+    def diagnostics(self) -> dict[str, dict[str, object]]:
+        return dict(self.order_flow.last_diagnostics)
