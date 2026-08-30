@@ -49,3 +49,28 @@ def test_orderflow_signal_opens_two_virtual_accounts_and_closes_at_target(tmp_pa
     assert all(trade.reason == "TARGET" for trade in closed)
     assert all(trade.net_pnl > 0 for trade in closed)
 
+
+def test_paper_execution_fails_over_when_mexc_book_is_missing(tmp_path) -> None:
+    settings = make_settings(tmp_path / "paper-failover.db")
+    market = MarketState(settings.symbols)
+    state = market.symbol("BTC_USDT")
+    for venue in ("bybit", "binance"):
+        state.book(venue).apply_snapshot(
+            bids=[[99.9, 100]], asks=[[100.1, 100]], ts=1_000
+        )
+    broker = PaperBroker(market, settings, account_configs(settings))
+    signal = Signal(
+        symbol="BTC_USDT",
+        strategy="order_flow",
+        setup="TREND_PULLBACK",
+        side=Side.LONG,
+        score=90,
+        stop_pct=0.01,
+        target_r=2.8,
+        ts=1_000,
+    )
+
+    opened = broker.handle_signal(signal, now=1_000)
+
+    assert len(opened) == 2
+    assert all(position.entry_price > 100 for position in opened)

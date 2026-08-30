@@ -121,10 +121,9 @@ class OrderFlowStrategy:
         blockers: list[str] = []
         if features.price <= 0:
             blockers.append("no_price")
-        if "mexc" in features.stale_venues:
-            blockers.append("mexc_book_stale")
-        if "bybit" in features.stale_venues and "binance" in features.stale_venues:
-            blockers.append("secondary_books_stale")
+        fresh_book_count = 3 - len(features.stale_venues)
+        if fresh_book_count < 2:
+            blockers.append("insufficient_fresh_books")
         if features.spread_bps >= 35.0:
             blockers.append("spread_too_wide")
         if features.trade_count_60s < 20:
@@ -147,6 +146,7 @@ class OrderFlowStrategy:
             "trade_count_60s": features.trade_count_60s,
             "history_span_seconds": history_span,
             "hour_closes": len(state.hour_closes),
+            "fresh_book_count": fresh_book_count,
             "blockers": blockers,
         }
         self.last_diagnostics[state.symbol] = diagnostic

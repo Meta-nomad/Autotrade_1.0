@@ -98,9 +98,18 @@ class PaperBroker:
         elif daily_return <= -self.settings.daily_stop_pct / 100.0:
             account.halted_reason = f"daily stop {daily_return:.1%}"
 
-    def _fill(self, symbol: str, execution_side: Side, notional: float, *, stress: float = 1.0) -> Fill | None:
+    def _fill(
+        self,
+        symbol: str,
+        execution_side: Side,
+        notional: float,
+        *,
+        now: float | None = None,
+        stress: float = 1.0,
+    ) -> Fill | None:
         state = self.market.symbol(symbol)
-        bbo = state.book("mexc").best_bid_ask()
+        current_time = now or time.time()
+        bbo = state.fresh_reference_bbo(current_time, self.settings.stale_after_seconds)
         if not bbo:
             return None
         bid, ask = bbo
@@ -160,7 +169,7 @@ class PaperBroker:
         notional = min(desired_notional, available_margin * account.max_leverage)
         if notional < 10.0:
             return None
-        fill = self._fill(signal.symbol, signal.side, notional)
+        fill = self._fill(signal.symbol, signal.side, notional, now=now)
         if fill is None:
             return None
         qty = notional / fill.price
@@ -221,7 +230,7 @@ class PaperBroker:
         liquidation_fee_rate: float = 0.0,
     ) -> ClosedTrade | None:
         exit_side = Side.SHORT if position.side == Side.LONG else Side.LONG
-        fill = self._fill(position.symbol, exit_side, position.notional, stress=stress)
+        fill = self._fill(position.symbol, exit_side, position.notional, now=now, stress=stress)
         if fill is None:
             return None
         gross = position.unrealized_pnl(fill.price)
@@ -271,7 +280,7 @@ class PaperBroker:
             self._roll_risk_periods(account, current_time)
             for symbol, position in list(account.positions.items()):
                 state = self.market.symbol(symbol)
-                bbo = state.book("mexc").best_bid_ask()
+                bbo = state.fresh_reference_bbo(current_time, self.settings.stale_after_seconds)
                 if not bbo:
                     continue
                 bid, ask = bbo
@@ -404,4 +413,3 @@ class PaperBroker:
 
     def snapshots(self) -> dict[str, dict[str, Any]]:
         return {name: account.as_dict() for name, account in self.accounts.items()}
-

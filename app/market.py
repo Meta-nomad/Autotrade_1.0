@@ -167,6 +167,16 @@ class SymbolState:
                 return bbo
         return None
 
+    def fresh_reference_bbo(self, now: float, stale_after: float) -> tuple[float, float] | None:
+        """Best available live BBO, preferring MEXC but allowing venue failover."""
+        for venue in ("mexc", "bybit", "binance"):
+            book = self.book(venue)
+            if book.is_fresh(now, stale_after):
+                bbo = book.best_bid_ask()
+                if bbo:
+                    return bbo
+        return None
+
     def reference_price(self) -> float:
         bbo = self.reference_bbo()
         if bbo:
@@ -292,8 +302,13 @@ class SymbolState:
 
     def features(self, now: float, stale_after: float) -> FeatureSnapshot:
         price = self.reference_price()
-        mexc_book = self.book("mexc")
-        spread = mexc_book.spread_bps() if mexc_book.best_bid_ask() else 99999.0
+        fresh_books = [
+            self.book(venue)
+            for venue in ("mexc", "bybit", "binance")
+            if self.book(venue).is_fresh(now, stale_after)
+            and self.book(venue).best_bid_ask()
+        ]
+        spread = fresh_books[0].spread_bps() if fresh_books else 99999.0
 
         returns = {
             seconds: self.venue_return("mexc", seconds, now)
@@ -381,14 +396,10 @@ class SymbolState:
         )
         mexc_history = self.price_history.get("mexc")
         history_span = mexc_history[-1][0] - mexc_history[0][0] if mexc_history and len(mexc_history) > 1 else 0.0
-        secondary_fresh = any(
-            self.book(venue).is_fresh(now, stale_after) for venue in ("bybit", "binance")
-        )
         total_trades = sum(trade_counts.values())
         ready = bool(
             price > 0
-            and mexc_book.is_fresh(now, stale_after)
-            and secondary_fresh
+            and len(fresh_books) >= 2
             and spread < 35.0
             and total_trades >= 20
             and history_span >= 300.0
@@ -477,4 +488,3 @@ class MarketState:
                 for symbol, state in self.symbols.items()
             },
         }
-

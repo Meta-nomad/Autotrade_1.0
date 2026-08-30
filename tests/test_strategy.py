@@ -47,16 +47,16 @@ def test_order_flow_diagnostics_explain_not_ready(tmp_path) -> None:
         spread_bps=2,
         data_ready=False,
         trade_count_60s=18,
-        stale_venues=("mexc",),
+        stale_venues=("mexc", "bybit", "binance"),
     )
     strategy = OrderFlowStrategy(settings)
 
     assert strategy.evaluate(state, feature, now=1_000) is None
     diagnostic = strategy.last_diagnostics["BTC_USDT"]
     assert diagnostic["state"] == "not_ready"
-    assert diagnostic["stale_venues"] == ["mexc"]
+    assert diagnostic["stale_venues"] == ["mexc", "bybit", "binance"]
     assert diagnostic["trade_count_60s"] == 18
-    assert "mexc_book_stale" in diagnostic["blockers"]
+    assert "insufficient_fresh_books" in diagnostic["blockers"]
     assert "too_few_trades" in diagnostic["blockers"]
 
 
