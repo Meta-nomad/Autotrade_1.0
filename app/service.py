@@ -7,6 +7,7 @@ from contextlib import suppress
 from typing import Any
 
 from .config import Settings, account_configs
+from . import __version__
 from .feeds.binance import BinanceFeed
 from .feeds.bybit import BybitFeed
 from .feeds.mexc import MexcFeed
@@ -57,7 +58,8 @@ class PaperTradingService:
         self.tasks.append(asyncio.create_task(self._engine_loop(), name="paper-engine"))
         self.tasks.append(asyncio.create_task(self._status_log_loop(), name="status-log"))
         LOGGER.info(
-            "SERVICE READY mode=%s symbols=%d paper_balance=%.2f",
+            "SERVICE READY version=%s mode=%s symbols=%d paper_balance=%.2f",
+            __version__,
             self.settings.data_mode,
             len(self.settings.symbols),
             self.settings.paper_balance,
@@ -129,7 +131,7 @@ class PaperTradingService:
             position_count = sum(int(item["positions_count"]) for item in accounts.values())
             LOGGER.info(
                 "PAPER STATUS engine_lag=%.1fs feeds=%s ready=%d/%d blockers=%s decisions=%s "
-                "best=%s signals=%d opens=%d closes=%d positions=%d errors=%s",
+                "best=%s regime=%s signals=%d opens=%d closes=%d positions=%d errors=%s",
                 lag,
                 ",".join(feed_parts),
                 ready_count,
@@ -137,6 +139,7 @@ class PaperTradingService:
                 blocker_text,
                 decision_text,
                 best_text,
+                self.router.last_regime.name,
                 self.signal_count,
                 self.open_count,
                 self.close_count,
@@ -174,27 +177,26 @@ class PaperTradingService:
                         trade.r_multiple,
                     )
 
-                for symbol, feature in features.items():
-                    state = self.market.symbol(symbol)
-                    control_signal, orderflow_signal = self.router.evaluate(state, feature, tick_started)
-                    for signal in (control_signal, orderflow_signal):
-                        if signal is None or not self._deduplicated(signal, tick_started):
-                            continue
-                        self.signal_count += 1
-                        await self.storage.save_signal(signal)
-                        opened = self.broker.handle_signal(signal, tick_started)
-                        for position in opened:
-                            self.open_count += 1
-                            LOGGER.info(
-                                "PAPER OPEN account=%s symbol=%s side=%s setup=%s score=%.1f notional=%.2f",
-                                position.account,
-                                position.symbol,
-                                position.side.label,
-                                position.setup,
-                                position.score,
-                                position.notional,
-                            )
+                signals = self.router.evaluate_all(self.market.symbols, features, tick_started)
+                for signal in signals:
+                    if not self._deduplicated(signal, tick_started):
+                        continue
+                    self.signal_count += 1
+                    await self.storage.save_signal(signal)
+                    opened = self.broker.handle_signal(signal, tick_started)
+                    for position in opened:
+                        self.open_count += 1
+                        LOGGER.info(
+                            "PAPER OPEN account=%s symbol=%s side=%s setup=%s score=%.1f notional=%.2f",
+                            position.account,
+                            position.symbol,
+                            position.side.label,
+                            position.setup,
+                            position.score,
+                            position.notional,
+                        )
 
+                for symbol, state in self.market.symbols.items():
                     if state.next_funding_at and tick_started >= state.next_funding_at:
                         settlement = state.next_funding_at
                         self.broker.apply_funding(symbol, state.funding_rate, settlement)
@@ -249,6 +251,10 @@ class PaperTradingService:
             "signal_count_since_start": self.signal_count,
             "open_count_since_start": self.open_count,
             "close_count_since_start": self.close_count,
+            "market_regime": self.router.last_regime.name,
+            "market_regime_direction": self.router.last_regime.direction,
+            "market_breadth": self.router.last_regime.breadth,
+            "market_stress": self.router.last_regime.stress,
             "symbols": self.router.diagnostics(),
         }
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .config import Settings
 from .market import SymbolState
@@ -189,7 +189,7 @@ class OrderFlowStrategy:
         )
         return Signal(
             symbol=state.symbol,
-            strategy="order_flow",
+            strategy="baseline",
             setup=candidate.setup,
             side=candidate.side,
             score=candidate.score,
@@ -198,6 +198,8 @@ class OrderFlowStrategy:
             ts=current_time,
             reasons=candidate.reasons,
             feature_data=features.as_dict(),
+            exit_mode="baseline",
+            max_holding_minutes=120,
         )
 
     @staticmethod
@@ -342,21 +344,251 @@ class OrderFlowStrategy:
         )
 
 
-class StrategyRouter:
+@dataclass(slots=True)
+class MarketRegime:
+    name: str
+    direction: int
+    breadth: float
+    stress: float
+
+
+class RegimeDetector:
+    @staticmethod
+    def detect(features: dict[str, FeatureSnapshot]) -> MarketRegime:
+        ready = [item for item in features.values() if item.data_ready]
+        if not ready:
+            return MarketRegime("WARMUP", 0, 0.5, 0.0)
+        breadth = sum(item.trend_score > 0.15 for item in ready) / len(ready)
+        negative_breadth = sum(item.trend_score < -0.15 for item in ready) / len(ready)
+        stress = sum(max(0.0, item.vol_ratio - 1.0) for item in ready) / len(ready)
+        btc = features.get("BTC_USDT")
+        btc_trend = btc.trend_score if btc and btc.data_ready else 0.0
+        if stress >= 0.65 or (btc and abs(btc.ret_300s) >= 0.012):
+            return MarketRegime("STRESS", 1 if btc_trend > 0 else -1, breadth, stress)
+        if btc_trend >= 0.20 and breadth >= 0.55:
+            return MarketRegime("TREND_UP", 1, breadth, stress)
+        if btc_trend <= -0.20 and negative_breadth >= 0.55:
+            return MarketRegime("TREND_DOWN", -1, breadth, stress)
+        return MarketRegime("RANGE", 0, breadth, stress)
+
+
+class TrendOrderFlowStrategy:
     def __init__(self, settings: Settings) -> None:
-        self.control = ControlStrategy()
-        self.order_flow = OrderFlowStrategy(settings)
+        self.settings = settings
 
     def evaluate(
         self,
         state: SymbolState,
         features: FeatureSnapshot,
-        now: float | None = None,
-    ) -> tuple[Signal | None, Signal | None]:
-        return (
-            self.control.evaluate(state, features, now),
-            self.order_flow.evaluate(state, features, now),
+        regime: MarketRegime,
+        now: float,
+    ) -> Signal | None:
+        if not features.data_ready or abs(features.trend_score) < 0.24:
+            return None
+        side = Side.LONG if features.trend_score > 0 else Side.SHORT
+        if regime.direction and int(side) != regime.direction:
+            return None
+        position = features.price_position if side == Side.LONG else 1.0 - features.price_position
+        if position < 0.68:
+            return None
+        direction = float(side)
+        flow = direction * (0.55 * features.flow_fast + 0.45 * features.flow_slow)
+        book = direction * features.book_imbalance
+        cross = direction * features.cross_venue_consensus
+        pullback = direction * features.ret_300s
+        if flow < 0.035 or book < -0.025 or cross < -0.08:
+            return None
+        if pullback < -0.006 or pullback > 0.015:
+            return None
+        score = 0.0
+        score += 30.0 * _scale(direction * features.trend_score, 0.20, 0.80)
+        score += 20.0 * _scale(position, 0.65, 1.0)
+        score += 22.0 * _scale(flow, 0.02, 0.28)
+        score += 10.0 * _scale(book, -0.03, 0.22)
+        score += 10.0 * _scale(cross, -0.08, 0.55)
+        score += 8.0 if regime.direction == int(side) else 3.0
+        score = _clamp(score, 0.0, 100.0)
+        if score < self.settings.signal_threshold:
+            return None
+        stop_pct = _clamp(max(features.atr_pct * 2.2, 0.007), 0.007, 0.035)
+        return Signal(
+            symbol=state.symbol,
+            strategy="trend_orderflow",
+            setup="REGIME_TREND",
+            side=side,
+            score=score,
+            stop_pct=stop_pct,
+            target_r=5.0,
+            ts=now,
+            reasons=[
+                f"market regime {regime.name}",
+                f"hourly trend {direction * features.trend_score:+.2f}",
+                f"multi-venue flow {flow:+.2f}",
+                f"30m range position {position:.2f}",
+            ],
+            feature_data=features.as_dict(),
+            exit_mode="trend",
+            max_holding_minutes=1_440,
         )
 
+
+class CrossSectionalMomentumStrategy:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self._last_bucket = -1
+
+    def evaluate_all(
+        self,
+        states: dict[str, SymbolState],
+        features: dict[str, FeatureSnapshot],
+        regime: MarketRegime,
+        now: float,
+    ) -> list[Signal]:
+        bucket = int(now // 900)
+        if bucket == self._last_bucket:
+            return []
+        ranked: list[tuple[float, str, FeatureSnapshot]] = []
+        for symbol, item in features.items():
+            if not item.data_ready:
+                continue
+            flow = 0.4 * item.flow_slow + 0.6 * item.cross_venue_consensus
+            momentum = (
+                0.45 * item.trend_score
+                + 0.25 * math.tanh(item.ret_1800s * 120.0)
+                + 0.20 * (2.0 * item.price_position - 1.0)
+                + 0.10 * flow
+            )
+            ranked.append((momentum, symbol, item))
+        if len(ranked) < 6:
+            return []
+        self._last_bucket = bucket
+        ranked.sort()
+        selected = ranked[:2] + ranked[-2:]
+        signals: list[Signal] = []
+        for momentum, symbol, item in selected:
+            if abs(momentum) < 0.22:
+                continue
+            side = Side.LONG if momentum > 0 else Side.SHORT
+            if regime.direction and int(side) != regime.direction and regime.name != "RANGE":
+                continue
+            score = _clamp(74.0 + abs(momentum) * 28.0, 0.0, 96.0)
+            stop_pct = _clamp(max(item.atr_pct * 2.5, 0.008), 0.008, 0.04)
+            signals.append(
+                Signal(
+                    symbol=symbol,
+                    strategy="cross_momentum",
+                    setup="CROSS_MOMENTUM",
+                    side=side,
+                    score=score,
+                    stop_pct=stop_pct,
+                    target_r=4.0,
+                    ts=now,
+                    reasons=[
+                        f"cross-sectional rank extreme {momentum:+.2f}",
+                        f"hourly trend {item.trend_score:+.2f}",
+                        f"30m return {item.ret_1800s:+.2%}",
+                        f"market regime {regime.name}",
+                    ],
+                    feature_data=item.as_dict(),
+                    exit_mode="trend",
+                    max_holding_minutes=720,
+                )
+            )
+        return signals
+
+
+class LiquidationReversalStrategy:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self._scorer = OrderFlowStrategy(settings)
+
+    def evaluate(
+        self,
+        state: SymbolState,
+        features: FeatureSnapshot,
+        regime: MarketRegime,
+        now: float,
+    ) -> Signal | None:
+        if not features.data_ready or regime.name not in {"STRESS", "RANGE"}:
+            return None
+        candidate = self._scorer._liquidation_reversal(features)
+        if candidate is None or abs(features.liquidation_imbalance) < 0.35:
+            return None
+        score = _clamp(candidate.score + 5.0, 0.0, 100.0)
+        if score < max(self.settings.signal_threshold, 80.0):
+            return None
+        stop_pct = _clamp(max(features.atr_pct * 1.6, 0.006), 0.006, 0.025)
+        return Signal(
+            symbol=state.symbol,
+            strategy="liquidation_reversal",
+            setup="LIQUIDATION_EXHAUSTION",
+            side=candidate.side,
+            score=score,
+            stop_pct=stop_pct,
+            target_r=1.5,
+            ts=now,
+            reasons=[f"market regime {regime.name}", *candidate.reasons],
+            feature_data=features.as_dict(),
+            exit_mode="fixed",
+            max_holding_minutes=180,
+        )
+
+
+class StrategyRouter:
+    def __init__(self, settings: Settings) -> None:
+        self.baseline = OrderFlowStrategy(settings)
+        self.trend = TrendOrderFlowStrategy(settings)
+        self.cross = CrossSectionalMomentumStrategy(settings)
+        self.reversal = LiquidationReversalStrategy(settings)
+        self.last_regime = MarketRegime("WARMUP", 0, 0.5, 0.0)
+
+    def evaluate_all(
+        self,
+        states: dict[str, SymbolState],
+        features: dict[str, FeatureSnapshot],
+        now: float | None = None,
+    ) -> list[Signal]:
+        current_time = now or time.time()
+        regime = RegimeDetector.detect(features)
+        self.last_regime = regime
+        signals: list[Signal] = []
+        ensemble_candidates: dict[str, Signal] = {}
+        for symbol, state in states.items():
+            item = features[symbol]
+            baseline = self.baseline.evaluate(state, item, current_time)
+            trend = self.trend.evaluate(state, item, regime, current_time)
+            reversal = self.reversal.evaluate(state, item, regime, current_time)
+            for signal in (baseline, trend, reversal):
+                if signal is not None:
+                    signals.append(signal)
+            for signal in (trend, reversal):
+                if signal is not None and signal.score >= 82.0:
+                    prior = ensemble_candidates.get(symbol)
+                    if prior is None or signal.score > prior.score:
+                        ensemble_candidates[symbol] = signal
+        cross_signals = self.cross.evaluate_all(states, features, regime, current_time)
+        signals.extend(cross_signals)
+        for signal in cross_signals:
+            if signal.score >= 82.0:
+                prior = ensemble_candidates.get(signal.symbol)
+                if prior is None or signal.score > prior.score:
+                    ensemble_candidates[signal.symbol] = signal
+        signals.extend(
+            replace(
+                signal,
+                strategy="ensemble",
+                setup=f"ENSEMBLE_{signal.setup}",
+                reasons=[f"ensemble selected {signal.strategy}", *signal.reasons],
+            )
+            for signal in ensemble_candidates.values()
+        )
+        return signals
+
     def diagnostics(self) -> dict[str, dict[str, object]]:
-        return dict(self.order_flow.last_diagnostics)
+        diagnostics = dict(self.baseline.last_diagnostics)
+        for item in diagnostics.values():
+            item["regime"] = self.last_regime.name
+            item["regime_direction"] = self.last_regime.direction
+            item["market_breadth"] = self.last_regime.breadth
+            item["market_stress"] = self.last_regime.stress
+        return diagnostics

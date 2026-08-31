@@ -105,6 +105,8 @@ class Signal:
     ts: float
     reasons: list[str] = field(default_factory=list)
     feature_data: dict[str, Any] = field(default_factory=dict)
+    exit_mode: str = "fixed"
+    max_holding_minutes: int = 120
 
     def as_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -136,6 +138,9 @@ class Position:
     last_funding_at: float = 0.0
     best_price: float = 0.0
     worst_price: float = 0.0
+    flow_reversal_started_at: float = 0.0
+    exit_mode: str = "fixed"
+    max_holding_minutes: int = 120
 
     def __post_init__(self) -> None:
         if not self.best_price:

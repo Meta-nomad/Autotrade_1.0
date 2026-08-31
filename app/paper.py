@@ -140,11 +140,28 @@ class PaperBroker:
             return False
         if len(account.positions) >= self.settings.max_open_positions:
             return False
+        cluster = self._correlation_cluster(signal.symbol)
+        if any(
+            self._correlation_cluster(symbol) == cluster
+            for symbol in account.positions
+        ):
+            return False
         if account.cooldowns.get(signal.symbol, 0.0) > now:
             return False
         if signal.score < self.settings.signal_threshold:
             return False
         return True
+
+    @staticmethod
+    def _correlation_cluster(symbol: str) -> str:
+        asset = symbol.split("_", 1)[0]
+        if asset in {"BTC", "ETH", "BNB", "SOL"}:
+            return "majors"
+        if asset in {"XRP", "ADA", "DOGE"}:
+            return "high_beta"
+        if asset in {"AVAX", "LINK"}:
+            return "infrastructure"
+        return asset
 
     def open_from_signal(self, account: AccountState, signal: Signal, now: float) -> Position | None:
         if not self.can_open(account, signal, now):
@@ -156,6 +173,10 @@ class PaperBroker:
 
         risk_pct = self._effective_risk_pct(account, signal)
         risk_budget = equity * risk_pct / 100.0
+        open_risk = sum(position.initial_risk_usdt for position in account.positions.values())
+        max_open_risk = equity * self.settings.max_portfolio_risk_pct / 100.0
+        if open_risk + risk_budget > max_open_risk:
+            return None
         estimated_cost_pct = 2.0 * self.settings.taker_fee_rate + (
             2.0 * self.settings.min_slippage_bps / 10_000.0
         )
@@ -203,6 +224,8 @@ class PaperBroker:
             target_price=target_price,
             target_r=signal.target_r,
             entry_fee=entry_fee,
+            exit_mode=signal.exit_mode,
+            max_holding_minutes=signal.max_holding_minutes,
         )
         account.positions[signal.symbol] = position
         account.cooldowns[signal.symbol] = now + self.settings.cooldown_seconds
@@ -309,7 +332,7 @@ class PaperBroker:
                 target_hit = mark >= position.target_price if position.side == Side.LONG else mark <= position.target_price
 
                 current_r = position.current_r(mark)
-                if current_r >= 1.5:
+                if current_r >= 1.0:
                     break_even_buffer = 2.0 * self.settings.taker_fee_rate + (
                         2.0 * self.settings.min_slippage_bps / 10_000.0
                     )
@@ -321,16 +344,39 @@ class PaperBroker:
                     else:
                         position.stop_price = min(position.stop_price, break_even)
 
+                if position.exit_mode == "trend" and current_r >= 1.25:
+                    risk_distance = abs(position.entry_price - position.initial_stop_price)
+                    trailing_distance = risk_distance * 1.35
+                    trailing_stop = position.best_price - float(position.side) * trailing_distance
+                    if position.side == Side.LONG:
+                        position.stop_price = max(position.stop_price, trailing_stop)
+                    else:
+                        position.stop_price = min(position.stop_price, trailing_stop)
+
                 age = current_time - position.opened_at
                 feature = features.get(symbol)
-                flow_reversal = bool(
-                    age >= 300.0
+                reversal_observed = bool(
+                    account.strategy == "baseline"
+                    and age >= self.settings.min_flow_exit_minutes * 60
                     and feature
-                    and current_r < 1.0
-                    and float(position.side) * feature.flow_fast < -0.25
-                    and float(position.side) * feature.book_imbalance < -0.08
+                    and current_r < 0.75
+                    and float(position.side) * feature.flow_fast < -0.30
+                    and float(position.side) * feature.flow_slow < -0.12
+                    and float(position.side) * feature.book_imbalance < -0.10
+                    and float(position.side) * feature.cross_venue_consensus < -0.10
                 )
-                timed_out = age >= self.settings.max_holding_minutes * 60 and current_r < 0.75
+                if reversal_observed:
+                    if not position.flow_reversal_started_at:
+                        position.flow_reversal_started_at = current_time
+                else:
+                    position.flow_reversal_started_at = 0.0
+                flow_reversal = bool(
+                    position.flow_reversal_started_at
+                    and current_time - position.flow_reversal_started_at
+                    >= self.settings.flow_exit_confirm_seconds
+                )
+                max_holding = position.max_holding_minutes or self.settings.max_holding_minutes
+                timed_out = age >= max_holding * 60 and current_r < 0.75
 
                 reason = ""
                 stress = 1.0
