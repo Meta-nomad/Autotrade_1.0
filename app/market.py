@@ -48,6 +48,7 @@ class SymbolState:
         default_factory=lambda: defaultdict(lambda: deque(maxlen=20_000))
     )
     minute_bars: deque[MinuteBar] = field(default_factory=lambda: deque(maxlen=4_000))
+    hour_bars: deque[MinuteBar] = field(default_factory=lambda: deque(maxlen=1_000))
     hour_closes: deque[tuple[int, float]] = field(default_factory=lambda: deque(maxlen=500))
     liquidations: deque[LiquidationEvent] = field(
         default_factory=lambda: deque(maxlen=20_000)
@@ -135,6 +136,15 @@ class SymbolState:
             if close > 0:
                 merged[int(ts)] = float(close)
         self.hour_closes = deque(sorted(merged.items())[-500:], maxlen=500)
+
+    def bootstrap_hour_bars(self, bars: Iterable[MinuteBar]) -> None:
+        merged = {bar.ts: bar for bar in self.hour_bars}
+        for bar in bars:
+            if bar.close > 0:
+                merged[int(bar.ts)] = bar
+        self.hour_bars = deque(
+            [merged[key] for key in sorted(merged)][-1_000:], maxlen=1_000
+        )
 
     def add_liquidation(self, event: LiquidationEvent) -> None:
         self.liquidations.append(event)
@@ -254,10 +264,10 @@ class SymbolState:
         values = [close for _, close in self.hour_closes]
         if price > 0:
             values = (values + [price])[-300:]
-        if len(values) < 50:
+        if len(values) < 200:
             return 0.0
-        fast = _ema(values[-120:], 20)
-        slow = _ema(values[-250:], 50)
+        fast = _ema(values[-240:], 80)
+        slow = _ema(values[-500:], 200)
         if slow <= 0:
             return 0.0
         return math.tanh((fast / slow - 1.0) * 80.0)
@@ -283,6 +293,70 @@ class SymbolState:
         grouped: dict[int, MinuteBar] = {}
         for bar in self.minute_bars:
             bucket = int(bar.ts // 900) * 900
+            existing = grouped.get(bucket)
+            if existing is None:
+                grouped[bucket] = MinuteBar(
+                    ts=bucket,
+                    open=bar.open,
+                    high=bar.high,
+                    low=bar.low,
+                    close=bar.close,
+                    volume_notional=bar.volume_notional,
+                )
+            else:
+                existing.high = max(existing.high, bar.high)
+                existing.low = min(existing.low, bar.low)
+                existing.close = bar.close
+                existing.volume_notional += bar.volume_notional
+        return [grouped[key] for key in sorted(grouped)][-limit:]
+
+    def hourly_bars(self, limit: int = 120) -> list[MinuteBar]:
+        grouped: dict[int, MinuteBar] = {
+            bar.ts: MinuteBar(
+                ts=bar.ts,
+                open=bar.open,
+                high=bar.high,
+                low=bar.low,
+                close=bar.close,
+                volume_notional=bar.volume_notional,
+            )
+            for bar in self.hour_bars
+        }
+        live_grouped: dict[int, MinuteBar] = {}
+        for bar in self.minute_bars:
+            bucket = int(bar.ts // 3_600) * 3_600
+            existing = live_grouped.get(bucket)
+            if existing is None:
+                live_grouped[bucket] = MinuteBar(
+                    ts=bucket,
+                    open=bar.open,
+                    high=bar.high,
+                    low=bar.low,
+                    close=bar.close,
+                    volume_notional=bar.volume_notional,
+                )
+            else:
+                existing.high = max(existing.high, bar.high)
+                existing.low = min(existing.low, bar.low)
+                existing.close = bar.close
+                existing.volume_notional += bar.volume_notional
+        for bucket, live in live_grouped.items():
+            existing = grouped.get(bucket)
+            if existing is None:
+                grouped[bucket] = live
+                continue
+            # The REST bootstrap may contain the still-forming hour. Merge its
+            # range with live trades, but do not count overlapping volume twice.
+            existing.high = max(existing.high, live.high)
+            existing.low = min(existing.low, live.low)
+            existing.close = live.close
+            existing.volume_notional = max(existing.volume_notional, live.volume_notional)
+        return [grouped[key] for key in sorted(grouped)][-limit:]
+
+    def four_hour_bars(self, limit: int = 120) -> list[MinuteBar]:
+        grouped: dict[int, MinuteBar] = {}
+        for bar in self.hourly_bars(limit=max(limit * 4 + 4, 120)):
+            bucket = int(bar.ts // 14_400) * 14_400
             existing = grouped.get(bucket)
             if existing is None:
                 grouped[bucket] = MinuteBar(
@@ -403,7 +477,7 @@ class SymbolState:
             and spread < 35.0
             and total_trades >= 20
             and history_span >= 300.0
-            and len(self.hour_closes) >= 50
+            and len(self.hour_closes) >= 200
         )
 
         snapshot = FeatureSnapshot(

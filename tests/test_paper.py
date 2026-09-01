@@ -14,15 +14,15 @@ def _seed_books(market: MarketState, bid: float, ask: float, ts: float) -> None:
         )
 
 
-def test_baseline_signal_opens_virtual_account_and_closes_at_target(tmp_path) -> None:
+def test_composite_signal_opens_single_account_and_closes_at_net_target(tmp_path) -> None:
     settings = make_settings(tmp_path / "paper.db")
     market = MarketState(settings.symbols)
     _seed_books(market, 99.9, 100.1, 1_000)
     broker = PaperBroker(market, settings, account_configs(settings))
     signal = Signal(
         symbol="BTC_USDT",
-        strategy="baseline",
-        setup="EXPANSION_BREAKOUT",
+        strategy="composite",
+        setup="SYSTEMATIC_BREAKOUT_4H",
         side=Side.LONG,
         score=95,
         stop_pct=0.01,
@@ -32,12 +32,12 @@ def test_baseline_signal_opens_virtual_account_and_closes_at_target(tmp_path) ->
 
     opened = broker.handle_signal(signal, now=1_000)
 
-    assert {position.account for position in opened} == {"BASELINE_016"}
+    assert {position.account for position in opened} == {"COMPOSITE_FLOW"}
     assert all(position.notional > 0 for position in opened)
 
-    _seed_books(market, 103.0, 103.1, 1_100)
+    _seed_books(market, 104.0, 104.1, 1_100)
     feature = FeatureSnapshot(
-        symbol="BTC_USDT", ts=1_100, price=103, spread_bps=2, data_ready=True
+        symbol="BTC_USDT", ts=1_100, price=104, spread_bps=2, data_ready=True
     )
     closed = broker.evaluate_positions({"BTC_USDT": feature}, now=1_100)
 
@@ -57,8 +57,8 @@ def test_paper_execution_fails_over_when_mexc_book_is_missing(tmp_path) -> None:
     broker = PaperBroker(market, settings, account_configs(settings))
     signal = Signal(
         symbol="BTC_USDT",
-        strategy="trend_orderflow",
-        setup="TREND_PULLBACK",
+        strategy="composite",
+        setup="SYSTEMATIC_BREAKOUT_4H",
         side=Side.LONG,
         score=90,
         stop_pct=0.01,
@@ -72,7 +72,7 @@ def test_paper_execution_fails_over_when_mexc_book_is_missing(tmp_path) -> None:
     assert all(position.entry_price > 100 for position in opened)
 
 
-def test_flow_reversal_needs_orderflow_account_age_and_confirmation(tmp_path) -> None:
+def test_composite_does_not_use_fast_orderflow_reversal(tmp_path) -> None:
     settings = make_settings(
         tmp_path / "paper-exit.db",
         min_flow_exit_minutes=15,
@@ -84,8 +84,8 @@ def test_flow_reversal_needs_orderflow_account_age_and_confirmation(tmp_path) ->
     broker = PaperBroker(market, settings, account_configs(settings))
     signal = Signal(
         symbol="BTC_USDT",
-        strategy="baseline",
-        setup="TREND_PULLBACK",
+        strategy="composite",
+        setup="SYSTEMATIC_BREAKOUT_4H",
         side=Side.LONG,
         score=95,
         stop_pct=0.02,
@@ -105,16 +105,11 @@ def test_flow_reversal_needs_orderflow_account_age_and_confirmation(tmp_path) ->
         cross_venue_consensus=-0.2,
     )
 
-    assert broker.evaluate_positions({"BTC_USDT": adverse}, now=1_899) == []
-    assert broker.evaluate_positions({"BTC_USDT": adverse}, now=1_900) == []
-    assert broker.evaluate_positions({"BTC_USDT": adverse}, now=1_989) == []
-    closed = broker.evaluate_positions({"BTC_USDT": adverse}, now=1_990)
-
-    assert len(closed) == 1
-    assert all(trade.reason == "ORDER_FLOW_REVERSAL" for trade in closed)
+    assert broker.evaluate_positions({"BTC_USDT": adverse}, now=1_990) == []
+    assert "BTC_USDT" in broker.accounts["COMPOSITE_FLOW"].positions
 
 
-def test_trend_account_ignores_baseline_orderflow_reversal(tmp_path) -> None:
+def test_composite_signal_uses_explicit_risk_override(tmp_path) -> None:
     settings = make_settings(
         tmp_path / "paper-control-exit.db",
         min_flow_exit_minutes=0,
@@ -126,8 +121,8 @@ def test_trend_account_ignores_baseline_orderflow_reversal(tmp_path) -> None:
     broker = PaperBroker(market, settings, account_configs(settings))
     signal = Signal(
         symbol="BTC_USDT",
-        strategy="trend_orderflow",
-        setup="REGIME_TREND",
+        strategy="composite",
+        setup="SYSTEMATIC_BREAKOUT_4H",
         side=Side.LONG,
         score=90,
         stop_pct=0.02,
@@ -135,20 +130,10 @@ def test_trend_account_ignores_baseline_orderflow_reversal(tmp_path) -> None:
         ts=1_000,
         exit_mode="trend",
         max_holding_minutes=1_440,
+        risk_pct=0.35,
     )
     opened = broker.handle_signal(signal, now=1_000)
     assert len(opened) == 1
-    adverse = FeatureSnapshot(
-        symbol="BTC_USDT",
-        ts=2_000,
-        price=99.9,
-        spread_bps=2,
-        data_ready=True,
-        flow_fast=-0.5,
-        flow_slow=-0.3,
-        book_imbalance=-0.2,
-        cross_venue_consensus=-0.2,
-    )
-
-    assert broker.evaluate_positions({"BTC_USDT": adverse}, now=2_000) == []
-    assert "BTC_USDT" in broker.accounts["TREND_ORDERFLOW"].positions
+    position = opened[0]
+    assert position.account == "COMPOSITE_FLOW"
+    assert 3.0 <= position.initial_risk_usdt <= 4.0

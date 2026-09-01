@@ -58,6 +58,9 @@ class Settings:
     module_risk_pct: float
     reversal_risk_pct: float
     ensemble_risk_pct: float
+    composite_low_risk_pct: float
+    composite_base_risk_pct: float
+    composite_high_risk_pct: float
     base_max_leverage: float
     turbo_max_leverage: float
     max_margin_utilization: float
@@ -68,6 +71,10 @@ class Settings:
     risk_reduction_drawdown_pct: float
     signal_threshold: float
     high_conviction_threshold: float
+    startup_warmup_seconds: int
+    regime_confirm_seconds: int
+    min_ready_ratio: float
+    max_entry_spread_bps: float
     evaluation_interval_seconds: float
     feature_persist_seconds: int
     account_persist_seconds: int
@@ -115,16 +122,23 @@ class Settings:
             module_risk_pct=_float("MODULE_RISK_PCT", 0.50),
             reversal_risk_pct=_float("REVERSAL_RISK_PCT", 0.35),
             ensemble_risk_pct=_float("ENSEMBLE_RISK_PCT", 0.50),
+            composite_low_risk_pct=_float("COMPOSITE_LOW_RISK_PCT", 0.35),
+            composite_base_risk_pct=_float("COMPOSITE_BASE_RISK_PCT", 0.50),
+            composite_high_risk_pct=_float("COMPOSITE_HIGH_RISK_PCT", 0.60),
             base_max_leverage=_float("BASE_MAX_LEVERAGE", 5.0),
             turbo_max_leverage=_float("TURBO_MAX_LEVERAGE", 8.0),
             max_margin_utilization=_float("MAX_MARGIN_UTILIZATION", 0.75),
-            max_portfolio_risk_pct=_float("MAX_PORTFOLIO_RISK_PCT", 1.50),
+            max_portfolio_risk_pct=_float("MAX_PORTFOLIO_RISK_PCT", 1.20),
             max_open_positions=_int("MAX_OPEN_POSITIONS", 2),
-            daily_stop_pct=_float("DAILY_STOP_PCT", 4.0),
-            monthly_stop_pct=_float("MONTHLY_STOP_PCT", 15.0),
+            daily_stop_pct=_float("DAILY_STOP_PCT", 2.0),
+            monthly_stop_pct=_float("MONTHLY_STOP_PCT", 8.0),
             risk_reduction_drawdown_pct=_float("RISK_REDUCTION_DRAWDOWN_PCT", 10.0),
-            signal_threshold=_float("SIGNAL_THRESHOLD", 75.0),
+            signal_threshold=_float("SIGNAL_THRESHOLD", 86.0),
             high_conviction_threshold=_float("HIGH_CONVICTION_THRESHOLD", 90.0),
+            startup_warmup_seconds=_int("STARTUP_WARMUP_SECONDS", 300),
+            regime_confirm_seconds=_int("REGIME_CONFIRM_SECONDS", 180),
+            min_ready_ratio=_float("MIN_READY_RATIO", 0.80),
+            max_entry_spread_bps=_float("MAX_ENTRY_SPREAD_BPS", 15.0),
             evaluation_interval_seconds=_float("EVALUATION_INTERVAL_SECONDS", 2.0),
             feature_persist_seconds=_int("FEATURE_PERSIST_SECONDS", 10),
             account_persist_seconds=_int("ACCOUNT_PERSIST_SECONDS", 10),
@@ -152,38 +166,10 @@ class AccountConfig:
 def account_configs(settings: Settings) -> tuple[AccountConfig, ...]:
     return (
         AccountConfig(
-            name="BASELINE_016",
-            strategy="baseline",
+            name="COMPOSITE_FLOW",
+            strategy="composite",
             starting_balance=settings.paper_balance,
-            risk_pct=settings.baseline_risk_pct,
-            max_leverage=settings.base_max_leverage,
-        ),
-        AccountConfig(
-            name="TREND_ORDERFLOW",
-            strategy="trend_orderflow",
-            starting_balance=settings.paper_balance,
-            risk_pct=settings.module_risk_pct,
-            max_leverage=settings.base_max_leverage,
-        ),
-        AccountConfig(
-            name="CROSS_MOMENTUM",
-            strategy="cross_momentum",
-            starting_balance=settings.paper_balance,
-            risk_pct=settings.module_risk_pct,
-            max_leverage=settings.base_max_leverage,
-        ),
-        AccountConfig(
-            name="LIQUIDATION_REVERSAL",
-            strategy="liquidation_reversal",
-            starting_balance=settings.paper_balance,
-            risk_pct=settings.reversal_risk_pct,
-            max_leverage=settings.base_max_leverage,
-        ),
-        AccountConfig(
-            name="ENSEMBLE",
-            strategy="ensemble",
-            starting_balance=settings.paper_balance,
-            risk_pct=settings.ensemble_risk_pct,
+            risk_pct=settings.composite_base_risk_pct,
             max_leverage=settings.base_max_leverage,
         ),
     )

@@ -1,3 +1,5 @@
+import math
+
 from app.market import SymbolState
 from app.models import FeatureSnapshot, MinuteBar, Side
 from app.strategy import (
@@ -209,31 +211,51 @@ def test_liquidation_reversal_is_separate_sparse_module(tmp_path) -> None:
     assert signal.max_holding_minutes == 180
 
 
-def test_router_adds_high_confidence_signal_to_ensemble(tmp_path) -> None:
-    settings = make_settings(tmp_path / "router.db", symbols=("BTC_USDT",))
-    state = SymbolState("BTC_USDT")
-    feature = FeatureSnapshot(
-        symbol="BTC_USDT",
-        ts=1_000,
-        price=100,
-        spread_bps=2,
-        data_ready=True,
-        trend_score=0.9,
-        vol_ratio=1.2,
-        price_position=0.98,
-        flow_fast=0.7,
-        flow_slow=0.6,
-        book_imbalance=0.5,
-        microprice_bps=3,
-        cross_venue_consensus=0.6,
-        oi_change_300s=0.02,
-        ret_300s=0.002,
-        atr_pct=0.006,
+def test_router_emits_only_single_composite_portfolio_signal(tmp_path) -> None:
+    symbols = tuple(f"C{i}_USDT" for i in range(6))
+    settings = make_settings(
+        tmp_path / "router.db",
+        symbols=symbols,
+        startup_warmup_seconds=0,
+        regime_confirm_seconds=0,
+        min_ready_ratio=0.8,
     )
+    states = {symbol: SymbolState(symbol) for symbol in symbols}
+    features = {}
+    base = 14_400 * 1_000
+    for symbol_index, symbol in enumerate(symbols):
+        for index in range(45):
+            price = 100 + index * 0.42 + math.sin(index * math.pi / 3) * 2.2
+            if index == 44:
+                price += 7.0
+            states[symbol].hour_bars.append(
+                MinuteBar(
+                    ts=base + index * 14_400,
+                    open=price - 0.2,
+                    high=price + 0.4,
+                    low=price - 0.4,
+                    close=price,
+                    volume_notional=2_000 if index == 44 else 1_000,
+                )
+            )
+        strength = 0.45 + symbol_index * 0.08
+        features[symbol] = FeatureSnapshot(
+            symbol=symbol,
+            ts=base,
+            price=states[symbol].hour_bars[-1].close,
+            spread_bps=2,
+            data_ready=True,
+            trend_score=strength,
+            flow_fast=0.5,
+            flow_slow=0.4,
+            book_imbalance=0.3,
+            cross_venue_consensus=0.4,
+            ret_1800s=0.01,
+            atr_pct=0.012,
+        )
+    now = base + 45 * 14_400 + 1
+    signals = StrategyRouter(settings).evaluate_all(states, features, now=now)
 
-    signals = StrategyRouter(settings).evaluate_all(
-        {"BTC_USDT": state}, {"BTC_USDT": feature}, now=1_000
-    )
-
-    assert any(signal.strategy == "trend_orderflow" for signal in signals)
-    assert any(signal.strategy == "ensemble" for signal in signals)
+    assert signals
+    assert all(signal.strategy == "composite" for signal in signals)
+    assert len(signals) <= settings.max_open_positions

@@ -99,8 +99,25 @@ class MexcFeed:
             ]
             self.market.symbol(symbol).bootstrap_minutes(bars)
         if isinstance(hour_data, dict):
-            closes = hour_data.get("close", [])
             times = hour_data.get("time", [])
+            opens = hour_data.get("open", [])
+            highs = hour_data.get("high", [])
+            lows = hour_data.get("low", [])
+            closes = hour_data.get("close", [])
+            amounts = hour_data.get("amount", hour_data.get("vol", []))
+            count = min(map(len, (times, opens, highs, lows, closes, amounts))) if times else 0
+            bars = [
+                MinuteBar(
+                    ts=int(times[index]),
+                    open=float(opens[index]),
+                    high=float(highs[index]),
+                    low=float(lows[index]),
+                    close=float(closes[index]),
+                    volume_notional=float(amounts[index]),
+                )
+                for index in range(count)
+            ]
+            self.market.symbol(symbol).bootstrap_hour_bars(bars)
             self.market.symbol(symbol).bootstrap_hours(
                 (int(ts), float(close)) for ts, close in zip(times, closes)
             )

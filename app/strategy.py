@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 from .config import Settings
 from .market import SymbolState
 from .models import FeatureSnapshot, Signal, Side
+from .structure import StructureContext, analyse_structure
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -130,7 +131,7 @@ class OrderFlowStrategy:
             blockers.append("too_few_trades")
         if history_span < 300.0:
             blockers.append("short_price_history")
-        if len(state.hour_closes) < 50:
+        if len(state.hour_closes) < 200:
             blockers.append("short_hour_history")
         diagnostic: dict[str, object] = {
             "symbol": state.symbol,
@@ -534,13 +535,252 @@ class LiquidationReversalStrategy:
         )
 
 
+class CompositeFlowStrategy:
+    """One portfolio strategy; modules provide evidence, never duplicate trades."""
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self._last_bar: dict[str, int] = {}
+        self._last_reversal_evaluation: dict[str, float] = {}
+        self._reversal_scorer = OrderFlowStrategy(settings)
+        self.last_diagnostics: dict[str, dict[str, object]] = {}
+
+    @staticmethod
+    def _rank_scores(features: dict[str, FeatureSnapshot]) -> dict[str, float]:
+        values: list[tuple[float, str]] = []
+        for symbol, item in features.items():
+            if not item.data_ready:
+                continue
+            flow = 0.45 * item.flow_slow + 0.55 * item.cross_venue_consensus
+            momentum = (
+                0.55 * item.trend_score
+                + 0.25 * math.tanh(item.ret_1800s * 100.0)
+                + 0.20 * flow
+            )
+            values.append((momentum, symbol))
+        values.sort()
+        if len(values) < 2:
+            return {symbol: 0.5 for _, symbol in values}
+        return {
+            symbol: index / (len(values) - 1)
+            for index, (_, symbol) in enumerate(values)
+        }
+
+    def _risk_pct(self, score: float, regime: MarketRegime) -> float:
+        if score >= 92.0:
+            risk = self.settings.composite_high_risk_pct
+        elif score >= 85.0:
+            risk = self.settings.composite_base_risk_pct
+        else:
+            risk = self.settings.composite_low_risk_pct
+        if regime.name == "STRESS":
+            risk *= 0.5
+        return risk
+
+    @staticmethod
+    def _flow_components(item: FeatureSnapshot, side: Side) -> tuple[float, float, float]:
+        direction = float(side)
+        flow = direction * (0.60 * item.flow_fast + 0.40 * item.flow_slow)
+        book = direction * item.book_imbalance
+        cross = direction * item.cross_venue_consensus
+        return flow, book, cross
+
+    def _trend_candidate(
+        self,
+        state: SymbolState,
+        item: FeatureSnapshot,
+        regime: MarketRegime,
+        rank: float,
+        bars: list[object],
+        now: float,
+    ) -> Signal | None:
+        if regime.name == "STRESS":
+            return None
+        side = Side.LONG if item.trend_score > 0 else Side.SHORT
+        direction = float(side)
+        directional_trend = direction * item.trend_score
+        rank_alignment = rank if side == Side.LONG else 1.0 - rank
+        if (
+            directional_trend < 0.20
+            or rank_alignment < 0.55
+            or (regime.direction and regime.direction != int(side))
+        ):
+            return None
+        structure: StructureContext = analyse_structure(bars, side)
+        if len(bars) < 40 or structure.atr_pct <= 0:
+            return None
+        flow, book, cross = self._flow_components(item, side)
+        if flow < -0.04 or book < -0.12 or cross < -0.15:
+            return None
+        current = bars[-1]
+        prior = bars[-21:-1]
+        breakout = (
+            current.close > max(bar.high for bar in prior)
+            if side == Side.LONG
+            else current.close < min(bar.low for bar in prior)
+        )
+        average_volume = sum(bar.volume_notional for bar in prior) / len(prior)
+        volume_ratio = current.volume_notional / average_volume if average_volume > 0 else 0.0
+        if not breakout or volume_ratio < 0.90:
+            return None
+        score = (
+            45.0
+            + 20.0 * _scale(directional_trend, 0.20, 0.75)
+            + 15.0 * rank_alignment
+            + 10.0 * _scale(flow, -0.04, 0.25)
+            + 5.0 * _scale(book, -0.12, 0.24)
+            + 5.0 * _scale(volume_ratio, 0.90, 2.50)
+        )
+        score = _clamp(score, 0.0, 100.0)
+        if score < self.settings.signal_threshold:
+            return None
+        stop_pct = _clamp(max(structure.atr_pct * 2.2, 0.012), 0.012, 0.060)
+        return Signal(
+            symbol=state.symbol,
+            strategy="composite",
+            setup="SYSTEMATIC_BREAKOUT_4H",
+            side=side,
+            score=score,
+            stop_pct=stop_pct,
+            target_r=5.0,
+            ts=now,
+            risk_pct=self._risk_pct(score, regime),
+            reasons=[
+                f"stable market regime {regime.name}",
+                "confirmed 4h 20-bar breakout",
+                f"structure diagnostic ready={structure.ready} impulse={structure.impulse_atr:.1f}ATR",
+                f"fibonacci diagnostic={structure.retracement:.3f} (not an entry trigger)",
+                f"trendline diagnostic={structure.trendline_distance_atr:.2f}ATR (not a filter)",
+                f"order-flow/book/cross={flow:+.2f}/{book:+.2f}/{cross:+.2f}",
+                f"cross-sectional rank={rank:.2f}",
+            ],
+            feature_data={
+                **item.as_dict(),
+                "regime": regime.name,
+                "rank": rank,
+                "structure": {
+                    "retracement": structure.retracement,
+                    "fib_quality": structure.fib_quality,
+                    "impulse_atr": structure.impulse_atr,
+                    "trendline_distance_atr": structure.trendline_distance_atr,
+                    "volume_ratio": volume_ratio,
+                },
+            },
+            exit_mode="trend",
+            max_holding_minutes=10_080,
+        )
+
+    def _reversal_candidate(
+        self,
+        state: SymbolState,
+        item: FeatureSnapshot,
+        regime: MarketRegime,
+        now: float,
+    ) -> Signal | None:
+        if regime.name not in {"RANGE", "STRESS"}:
+            return None
+        previous = self._last_reversal_evaluation.get(state.symbol, 0.0)
+        if now - previous < 60.0:
+            return None
+        self._last_reversal_evaluation[state.symbol] = now
+        candidate = self._reversal_scorer._liquidation_reversal(item)
+        if candidate is None or abs(item.liquidation_imbalance) < 0.45:
+            return None
+        score = _clamp(candidate.score + (8.0 if regime.name == "STRESS" else 4.0), 0.0, 100.0)
+        if score < max(82.0, self.settings.signal_threshold):
+            return None
+        stop_pct = _clamp(max(item.atr_pct * 1.8, 0.006), 0.006, 0.025)
+        return Signal(
+            symbol=state.symbol,
+            strategy="composite",
+            setup="LIQUIDATION_EXHAUSTION",
+            side=candidate.side,
+            score=score,
+            stop_pct=stop_pct,
+            target_r=1.8,
+            ts=now,
+            risk_pct=self._risk_pct(score, regime),
+            reasons=[f"stable market regime {regime.name}", *candidate.reasons],
+            feature_data={**item.as_dict(), "regime": regime.name},
+            exit_mode="fixed",
+            max_holding_minutes=180,
+        )
+
+    def evaluate_all(
+        self,
+        states: dict[str, SymbolState],
+        features: dict[str, FeatureSnapshot],
+        regime: MarketRegime,
+        now: float,
+    ) -> list[Signal]:
+        ranks = self._rank_scores(features)
+        signals: list[Signal] = []
+        for symbol, state in states.items():
+            item = features[symbol]
+            diagnostic: dict[str, object] = {
+                "symbol": symbol,
+                "ts": now,
+                "data_ready": item.data_ready,
+                "state": "no_setup",
+                "best_setup": None,
+                "best_score": None,
+                "threshold": self.settings.signal_threshold,
+                "spread_bps": item.spread_bps,
+                "trade_count_60s": item.trade_count_60s,
+                "rank": ranks.get(symbol, 0.5),
+                "blockers": [],
+            }
+            self.last_diagnostics[symbol] = diagnostic
+            if not item.data_ready:
+                diagnostic["state"] = "not_ready"
+                diagnostic["blockers"] = ["data_not_ready"]
+                continue
+            if item.spread_bps > self.settings.max_entry_spread_bps:
+                diagnostic["state"] = "blocked"
+                diagnostic["blockers"] = ["spread_too_wide"]
+                continue
+
+            bars = state.four_hour_bars(limit=120)
+            current_bucket = int(now // 14_400) * 14_400
+            completed = [bar for bar in bars if bar.ts < current_bucket]
+            trend_signal: Signal | None = None
+            if completed:
+                latest_ts = completed[-1].ts
+                if self._last_bar.get(symbol) != latest_ts:
+                    self._last_bar[symbol] = latest_ts
+                    trend_signal = self._trend_candidate(
+                        state, item, regime, ranks.get(symbol, 0.5), completed, now
+                    )
+            reversal_signal = self._reversal_candidate(state, item, regime, now)
+            candidate = max(
+                (value for value in (trend_signal, reversal_signal) if value is not None),
+                key=lambda value: value.score,
+                default=None,
+            )
+            if candidate is None:
+                diagnostic["blockers"] = [
+                    "no_qualified_setup" if completed else "no_completed_4h"
+                ]
+                continue
+            diagnostic["state"] = "signal"
+            diagnostic["best_setup"] = candidate.setup
+            diagnostic["best_score"] = candidate.score
+            signals.append(candidate)
+        # Portfolio arbitration: at most the two highest-confidence ideas are
+        # sent to the broker. Correlation/risk checks can reduce this further.
+        signals.sort(key=lambda value: value.score, reverse=True)
+        return signals[: self.settings.max_open_positions]
+
+
 class StrategyRouter:
     def __init__(self, settings: Settings) -> None:
-        self.baseline = OrderFlowStrategy(settings)
-        self.trend = TrendOrderFlowStrategy(settings)
-        self.cross = CrossSectionalMomentumStrategy(settings)
-        self.reversal = LiquidationReversalStrategy(settings)
+        self.settings = settings
+        self.composite = CompositeFlowStrategy(settings)
         self.last_regime = MarketRegime("WARMUP", 0, 0.5, 0.0)
+        self.raw_regime = self.last_regime
+        self._started_at: float | None = None
+        self._candidate_key: tuple[str, int] | None = None
+        self._candidate_since = 0.0
 
     def evaluate_all(
         self,
@@ -549,45 +789,51 @@ class StrategyRouter:
         now: float | None = None,
     ) -> list[Signal]:
         current_time = now or time.time()
-        regime = RegimeDetector.detect(features)
-        self.last_regime = regime
-        signals: list[Signal] = []
-        ensemble_candidates: dict[str, Signal] = {}
-        for symbol, state in states.items():
-            item = features[symbol]
-            baseline = self.baseline.evaluate(state, item, current_time)
-            trend = self.trend.evaluate(state, item, regime, current_time)
-            reversal = self.reversal.evaluate(state, item, regime, current_time)
-            for signal in (baseline, trend, reversal):
-                if signal is not None:
-                    signals.append(signal)
-            for signal in (trend, reversal):
-                if signal is not None and signal.score >= 82.0:
-                    prior = ensemble_candidates.get(symbol)
-                    if prior is None or signal.score > prior.score:
-                        ensemble_candidates[symbol] = signal
-        cross_signals = self.cross.evaluate_all(states, features, regime, current_time)
-        signals.extend(cross_signals)
-        for signal in cross_signals:
-            if signal.score >= 82.0:
-                prior = ensemble_candidates.get(signal.symbol)
-                if prior is None or signal.score > prior.score:
-                    ensemble_candidates[signal.symbol] = signal
-        signals.extend(
-            replace(
-                signal,
-                strategy="ensemble",
-                setup=f"ENSEMBLE_{signal.setup}",
-                reasons=[f"ensemble selected {signal.strategy}", *signal.reasons],
-            )
-            for signal in ensemble_candidates.values()
+        if self._started_at is None:
+            self._started_at = current_time
+        raw = RegimeDetector.detect(features)
+        self.raw_regime = raw
+        key = (raw.name, raw.direction)
+        if key != self._candidate_key:
+            self._candidate_key = key
+            self._candidate_since = current_time
+        ready_count = sum(item.data_ready for item in features.values())
+        ready_ratio = ready_count / len(features) if features else 0.0
+        warmup_elapsed = current_time - self._started_at
+        regime_elapsed = current_time - self._candidate_since
+        stable = bool(
+            raw.name != "WARMUP"
+            and ready_ratio >= self.settings.min_ready_ratio
+            and warmup_elapsed >= self.settings.startup_warmup_seconds
+            and regime_elapsed >= self.settings.regime_confirm_seconds
         )
-        return signals
+        self.last_regime = raw if stable else MarketRegime("WARMUP", 0, raw.breadth, raw.stress)
+        if not stable:
+            for symbol, item in features.items():
+                self.composite.last_diagnostics[symbol] = {
+                    "symbol": symbol,
+                    "ts": current_time,
+                    "data_ready": item.data_ready,
+                    "state": "warmup",
+                    "best_setup": None,
+                    "best_score": None,
+                    "threshold": self.settings.signal_threshold,
+                    "spread_bps": item.spread_bps,
+                    "trade_count_60s": item.trade_count_60s,
+                    "blockers": [
+                        f"startup={warmup_elapsed:.0f}/{self.settings.startup_warmup_seconds}s",
+                        f"regime={regime_elapsed:.0f}/{self.settings.regime_confirm_seconds}s",
+                        f"ready={ready_ratio:.0%}",
+                    ],
+                }
+            return []
+        return self.composite.evaluate_all(states, features, raw, current_time)
 
     def diagnostics(self) -> dict[str, dict[str, object]]:
-        diagnostics = dict(self.baseline.last_diagnostics)
+        diagnostics = dict(self.composite.last_diagnostics)
         for item in diagnostics.values():
             item["regime"] = self.last_regime.name
+            item["raw_regime"] = self.raw_regime.name
             item["regime_direction"] = self.last_regime.direction
             item["market_breadth"] = self.last_regime.breadth
             item["market_stress"] = self.last_regime.stress

@@ -64,6 +64,10 @@ class PaperTradingService:
             len(self.settings.symbols),
             self.settings.paper_balance,
         )
+        LOGGER.info(
+            "RELEASE v0.3.0-20260901 accounts=%s execution=PAPER_ONLY",
+            ",".join(self.broker.accounts),
+        )
 
     async def _start_live_feeds(self) -> None:
         mexc = MexcFeed(self.market, self.settings)
@@ -81,7 +85,15 @@ class PaperTradingService:
         LOGGER.info("LIVE FEEDS STARTED venues=%s", ",".join(feed.name for feed in feeds))
         try:
             await mexc.bootstrap()
-            LOGGER.info("MEXC BOOTSTRAP COMPLETE symbols=%d", len(self.settings.symbols))
+            history_ready = sum(
+                len(self.market.symbol(symbol).hour_closes) >= 200
+                for symbol in self.settings.symbols
+            )
+            LOGGER.info(
+                "MEXC BOOTSTRAP COMPLETE history_ready=%d/%d",
+                history_ready,
+                len(self.settings.symbols),
+            )
         except Exception as exc:
             LOGGER.exception("MEXC bootstrap failed: %s", exc)
             await self.storage.event(time.time(), "ERROR", "MEXC_BOOTSTRAP", str(exc))
@@ -89,7 +101,7 @@ class PaperTradingService:
 
     async def _status_log_loop(self) -> None:
         """Emit a low-volume operational heartbeat for hosting logs."""
-        await asyncio.sleep(10.0)
+        await asyncio.sleep(5.0)
         while not self._stopping:
             now = time.time()
             lag = now - self.last_engine_tick if self.last_engine_tick else -1.0
@@ -129,9 +141,14 @@ class PaperTradingService:
             ) or "none"
             accounts = self.broker.status()
             position_count = sum(int(item["positions_count"]) for item in accounts.values())
+            composite = accounts.get("COMPOSITE_FLOW", {})
+            equity = float(composite.get("equity", 0.0))
+            realised = float(composite.get("realized_pnl", 0.0))
+            floating = equity - float(composite.get("balance", equity))
             LOGGER.info(
                 "PAPER STATUS engine_lag=%.1fs feeds=%s ready=%d/%d blockers=%s decisions=%s "
-                "best=%s regime=%s signals=%d opens=%d closes=%d positions=%d errors=%s",
+                "best=%s regime=%s raw_regime=%s equity=%.2f realized=%.2f floating=%.2f "
+                "signals=%d opens=%d closes=%d positions=%d errors=%s",
                 lag,
                 ",".join(feed_parts),
                 ready_count,
@@ -140,13 +157,17 @@ class PaperTradingService:
                 decision_text,
                 best_text,
                 self.router.last_regime.name,
+                self.router.raw_regime.name,
+                equity,
+                realised,
+                floating,
                 self.signal_count,
                 self.open_count,
                 self.close_count,
                 position_count,
                 " | ".join(errors) if errors else "none",
             )
-            await asyncio.sleep(60.0)
+            await asyncio.sleep(30.0)
 
     def _deduplicated(self, signal: Signal, now: float) -> bool:
         key = (signal.strategy, signal.symbol, signal.setup, int(signal.side))
@@ -233,6 +254,7 @@ class PaperTradingService:
     async def status(self) -> dict[str, Any]:
         now = time.time()
         return {
+            "version": __version__,
             "mode": "PAPER_ONLY",
             "data_mode": self.settings.data_mode,
             "live_trading_enabled": False,
@@ -252,6 +274,7 @@ class PaperTradingService:
             "open_count_since_start": self.open_count,
             "close_count_since_start": self.close_count,
             "market_regime": self.router.last_regime.name,
+            "raw_market_regime": self.router.raw_regime.name,
             "market_regime_direction": self.router.last_regime.direction,
             "market_breadth": self.router.last_regime.breadth,
             "market_stress": self.router.last_regime.stress,

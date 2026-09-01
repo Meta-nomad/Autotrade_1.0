@@ -103,6 +103,7 @@ class Signal:
     stop_pct: float
     target_r: float
     ts: float
+    risk_pct: float = 0.0
     reasons: list[str] = field(default_factory=list)
     feature_data: dict[str, Any] = field(default_factory=dict)
     exit_mode: str = "fixed"
@@ -224,6 +225,7 @@ class AccountState:
     total_funding: float = 0.0
     wins: int = 0
     losses: int = 0
+    stop_losses_today: int = 0
     positions: dict[str, Position] = field(default_factory=dict)
     cooldowns: dict[str, float] = field(default_factory=dict)
     halted_reason: str = ""

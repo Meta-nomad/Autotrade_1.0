@@ -1,0 +1,19 @@
+{
+  "source": "https://data.binance.vision/",
+  "market": "Binance USD-M futures monthly klines",
+  "interval": "15m",
+  "requested_period": "2022-01 through 2026-07",
+  "note": "Raw gzip files are intentionally excluded from the deployment archive; reproduce them with scripts/download_binance_history.py.",
+  "files": [
+    {"symbol": "ADAUSDT", "rows": 160608, "sha256": "52dd9156dfc3eac8cfc150e25b54bcb4d28e85841679d52a809c2e62c230302a"},
+    {"symbol": "AVAXUSDT", "rows": 160608, "sha256": "ca1aa8d7000ccabd9c224c7d2c29ac3b705f39267eee123d5882eea120df78ef"},
+    {"symbol": "BNBUSDT", "rows": 160608, "sha256": "965b6cbaa6b98a1d7a95e68ad3932ae5bd48e3b105853b89c2b1a91031594be9"},
+    {"symbol": "BTCUSDT", "rows": 160608, "sha256": "fa90af8d718e37e3fd877e1ba12f3b3ea3ed4f7db15cb2138a1cc518def03d85"},
+    {"symbol": "DOGEUSDT", "rows": 160608, "sha256": "ab8e861b3c0ffee09ea547f6ce8d577f3e1cc7e1449af82c9889a49dda5ced2a"},
+    {"symbol": "ETHUSDT", "rows": 160608, "sha256": "6ea02861718379eda815679e7be84b302b9acb50b6f3ab5b46d122a2e5481a2a"},
+    {"symbol": "LINKUSDT", "rows": 160608, "sha256": "3d9912191407d5a3b49e59555bde96d4baa08301810c13dcfa231fcf0289e6cb"},
+    {"symbol": "LTCUSDT", "rows": 160128, "sha256": "6d25d42d8d43a0a00fe83e01242bdfe31addc5b2da9eac7e5fa51d2797bfaa46"},
+    {"symbol": "SOLUSDT", "rows": 160128, "sha256": "7a328523866612001b62806262000615f3ef1dbc147ea0570ffe1692a174ebef"},
+    {"symbol": "XRPUSDT", "rows": 160128, "sha256": "0044e6a8d929b5b612b9486982745ed7589af9059eb28db4f3f8bdec2397d5f8"}
+  ]
+}

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import logging
+import sys
 import time
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import HTMLResponse
 
+from . import __version__
 from .config import Settings
 from .service import PaperTradingService
 
@@ -15,6 +17,8 @@ settings = Settings.from_env()
 logging.basicConfig(
     level=getattr(logging, settings.log_level, logging.INFO),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    stream=sys.stdout,
+    force=True,
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 service = PaperTradingService(settings)
@@ -31,7 +35,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Order Flow Paper Lab",
-    version="0.2.0",
+    version="0.3.0",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url=None,
@@ -51,6 +55,7 @@ async def health() -> dict[str, object]:
     lag = time.time() - service.last_engine_tick if service.last_engine_tick else None
     healthy = bool(service.last_engine_tick and lag is not None and lag < 30 and not service.last_engine_error)
     return {
+        "version": __version__,
         "status": "ok" if healthy else "starting",
         "paper_only": True,
         "live_trading_enabled": False,

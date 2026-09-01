@@ -78,6 +78,7 @@ class PaperBroker:
         if account.day_key != day_key:
             account.day_key = day_key
             account.day_start_equity = equity
+            account.stop_losses_today = 0
             if account.halted_reason.startswith("daily"):
                 account.halted_reason = ""
         if account.month_key != month_key:
@@ -121,16 +122,20 @@ class PaperBroker:
         return Fill(price=price, slippage_bps=slippage)
 
     def _effective_risk_pct(self, account: AccountState, signal: Signal) -> float:
-        if signal.score < 84.0:
-            conviction = 0.65
-        elif signal.score < self.settings.high_conviction_threshold:
-            conviction = 0.85
+        if signal.risk_pct > 0:
+            risk_pct = signal.risk_pct
         else:
-            conviction = 1.0
+            if signal.score < 84.0:
+                conviction = 0.65
+            elif signal.score < self.settings.high_conviction_threshold:
+                conviction = 0.85
+            else:
+                conviction = 1.0
+            risk_pct = account.risk_pct * conviction
         drawdown = 1.0 - self.equity(account) / account.peak_equity if account.peak_equity > 0 else 0.0
         if drawdown >= self.settings.risk_reduction_drawdown_pct / 100.0:
-            conviction *= 0.5
-        return account.risk_pct * conviction
+            risk_pct *= 0.5
+        return risk_pct
 
     def can_open(self, account: AccountState, signal: Signal, now: float) -> bool:
         self._roll_risk_periods(account, now)
@@ -198,13 +203,18 @@ class PaperBroker:
         account.balance -= entry_fee
         account.total_fees += entry_fee
 
-        stop_price = fill.price * (1.0 - float(signal.side) * signal.stop_pct)
-        target_price = fill.price * (1.0 + float(signal.side) * signal.stop_pct * signal.target_r)
         actual_risk = notional * (
             signal.stop_pct
             + 2.0 * self.settings.taker_fee_rate
             + 2.0 * fill.slippage_bps / 10_000.0
         )
+        stop_price = fill.price * (1.0 - float(signal.side) * signal.stop_pct)
+        # Translate the requested reward/risk into a target after estimated
+        # round-trip fees. The old implementation called a gross 1.5R target
+        # "1.5R" even when the realised net trade was close to 1R.
+        target_gross = signal.target_r * actual_risk + entry_fee + notional * self.settings.taker_fee_rate
+        target_move_pct = target_gross / notional
+        target_price = fill.price * (1.0 + float(signal.side) * target_move_pct)
         position = Position(
             id=uuid.uuid4().hex,
             account=account.name,
@@ -268,6 +278,10 @@ class PaperBroker:
             account.wins += 1
         else:
             account.losses += 1
+        if reason == "STOP" and net < 0:
+            account.stop_losses_today += 1
+            if account.stop_losses_today >= 3:
+                account.halted_reason = "daily stop-count 3"
         trade = ClosedTrade(
             id=position.id,
             account=account.name,
@@ -441,6 +455,7 @@ class PaperBroker:
             "positions_count": len(account.positions),
             "wins": account.wins,
             "losses": account.losses,
+            "stop_losses_today": account.stop_losses_today,
             "win_rate_pct": account.wins / trades * 100.0 if trades else 0.0,
             "realized_pnl": account.realized_pnl,
             "total_fees": account.total_fees,

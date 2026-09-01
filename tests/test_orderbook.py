@@ -37,7 +37,7 @@ def test_features_are_ready_with_two_fresh_non_mexc_books() -> None:
         )
         for index in range(7)
     )
-    state.bootstrap_hours((int(now - (50 - index) * 3_600), 90 + index * 0.1) for index in range(50))
+    state.bootstrap_hours((int(now - (200 - index) * 3_600), 80 + index * 0.1) for index in range(200))
     for index in range(20):
         state.add_trade(
             TradeEvent(
